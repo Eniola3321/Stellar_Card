@@ -12,6 +12,7 @@ const { rpc } = require('@stellar/stellar-sdk');
 const { event: bizEvent } = require('../lib/logger');
 const db = require('../db');
 const { parsePaymentEvent } = require('./parse-payment-event');
+const { createBatchProcessor, DEFAULT_BATCH_SIZE } = require('./batch-processor');
 
 const NETWORK = process.env.STELLAR_NETWORK || 'mainnet';
 const SOROBAN_RPC_URL =
@@ -564,9 +565,53 @@ async function handlePaymentEvent(event, onPayment, log) {
   }
 }
 
+// ── High-throughput batch ingestion ───────────────────────────────────────
+//
+// poll() above dispatches events one at a time (`await handlePaymentEvent(...)`),
+// which costs one implicit SQLite transaction — and, in WAL mode with
+// synchronous=FULL, one fsync — per event. That is fine for the steady-state
+// trickle but wasteful for the bursts the receiver contract sees when several
+// agents pay within the same ledger.
+//
+// processPaymentEventBatch() cuts a burst into chunks of at most
+// DEFAULT_BATCH_SIZE (50) and drives each chunk through a single
+// db.transaction() with a savepoint per item, so N events cost
+// ceil(N / 50) commit boundaries and one failing event cannot roll back its
+// independent neighbours. See payments/batch-processor.js for the isolation
+// contract.
+//
+// The batch engine is deliberately kept separate from poll(): poll() maps
+// events through the asynchronous, network-touching handlePayment pipeline,
+// whereas the batcher owns only the synchronous order-state writes that are
+// safe to run inside one transaction. Callers supply the applier that
+// performs those writes (for example the pending_payment → ordering claim).
+
+/**
+ * Ingest a batch of payment events, applying `applyItem` to each event inside
+ * a single transaction per chunk of at most DEFAULT_BATCH_SIZE events.
+ *
+ * @param {unknown[]} events  parsed payment events
+ * @param {(event: unknown) => unknown} applyItem  synchronous per-event DB update
+ * @param {{batchSize?: number, onItemError?: (err: unknown, item: unknown) => void}} [options]
+ * @returns {{total: number, applied: number, failed: number, chunks: number, results: unknown[]}}
+ */
+function processPaymentEventBatch(events, applyItem, options = {}) {
+  const processor = createBatchProcessor({
+    database: db,
+    batchSize: options.batchSize ?? DEFAULT_BATCH_SIZE,
+    // batch-processor stays logger-agnostic; wire its warn/error output into
+    // the structured event stream here so failures are visible to ops.
+    log: (level, message, fields) => bizEvent(message, { level, ...(fields || {}) }),
+    onItemError: options.onItemError,
+  });
+  return processor.processBatch(events, applyItem);
+}
+
 module.exports = {
   startWatcher,
   handlePaymentEvent,
+  processPaymentEventBatch,
+  _BATCH_SIZE: DEFAULT_BATCH_SIZE,
   _resetDispatchRetries,
   _getDispatchRetryMapSize,
   _peekDispatchRetry,
